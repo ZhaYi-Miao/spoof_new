@@ -1,0 +1,411 @@
+﻿#include <windows.h>
+#include <commdlg.h>
+#include <tlhelp32.h>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <random>
+
+#define ID_BUTTON_SYSTEM       101
+#define ID_BUTTON_USER         102
+#define ID_BUTTON_EARLY        103
+#define ID_BUTTON_RANDOM       104
+#define ID_BUTTON_SELECT_FILE  105
+#define ID_BUTTON_SELECT_PID   106
+#define ID_EDIT_PID_INPUT      107
+#define ID_BUTTON_FIND_NVIDIA  108
+#define ID_LOG_BOX             201
+
+std::wstring selectedAppPath = L"";
+HWND hLogBox = nullptr;
+void LaunchWithSpecificParent(HWND hwnd, DWORD parentPid);
+
+std::vector<DWORD> FindNvidiaOverlayPIDs() {
+    std::vector<DWORD> matchingPIDs;
+    std::wstring targetPath = L"C:\\Program Files\\NVIDIA Corporation\\NVIDIA App\\CEF\\NVIDIA Overlay.exe";
+
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) return matchingPIDs;
+    if (hSnapshot == INVALID_HANDLE_VALUE) return matchingPIDs;
+
+    PROCESSENTRY32W pe;
+    pe.dwSize = sizeof(pe);
+
+    if (Process32FirstW(hSnapshot, &pe)) {
+        do {
+            HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+            if (hProcess) {
+                wchar_t exePath[MAX_PATH];
+                DWORD size = MAX_PATH;
+                if (QueryFullProcessImageNameW(hProcess, 0, exePath, &size)) {
+                    if (_wcsicmp(exePath, targetPath.c_str()) == 0) {
+                        matchingPIDs.push_back(pe.th32ProcessID);
+                    }
+                }
+                CloseHandle(hProcess);
+            }
+        } while (Process32NextW(hSnapshot, &pe));
+    }
+
+    CloseHandle(hSnapshot);
+    return matchingPIDs;
+}
+
+BOOL EnableDebugPrivilege() {
+    HANDLE hToken;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken))
+        return FALSE;
+
+    TOKEN_PRIVILEGES tp;
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    LookupPrivilegeValue(NULL, SE_DEBUG_NAME, &tp.Privileges[0].Luid);
+
+    BOOL result = AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, NULL);
+    CloseHandle(hToken);
+    return result && GetLastError() == ERROR_SUCCESS;
+}
+
+struct ProcessInfo {
+    std::wstring name;
+    DWORD pid;
+    FILETIME creationTime;
+};
+
+struct HandleWrapper {
+    HANDLE h;
+    HandleWrapper(HANDLE handle) : h(handle) {}
+    ~HandleWrapper() { if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h); }
+    operator HANDLE() const { return h; }
+};
+
+void AppendLog(const std::wstring& text) {
+    if (!hLogBox) return;
+    int len = GetWindowTextLength(hLogBox);
+    SendMessage(hLogBox, EM_SETSEL, len, len);
+    std::wstring line = text + L"\r\n";
+    SendMessage(hLogBox, EM_REPLACESEL, FALSE, (LPARAM)line.c_str());
+}
+
+DWORD GetProcessIdByName(const std::wstring& processName) {
+    PROCESSENTRY32W entry;
+    entry.dwSize = sizeof(PROCESSENTRY32W);
+    HandleWrapper snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+    if (snapshot.h == INVALID_HANDLE_VALUE) return 0;
+
+    if (Process32FirstW(snapshot, &entry)) {
+        do {
+            if (_wcsicmp(processName.c_str(), entry.szExeFile) == 0) {
+                return entry.th32ProcessID;
+            }
+        } while (Process32NextW(snapshot, &entry));
+    }
+    return 0;
+}
+
+std::vector<ProcessInfo> GetAllProcesses() {
+    std::vector<ProcessInfo> processes;
+    PROCESSENTRY32W entry;
+    entry.dwSize = sizeof(PROCESSENTRY32W);
+    HandleWrapper snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+    if (snapshot.h == INVALID_HANDLE_VALUE) return processes;
+
+    if (Process32FirstW(snapshot, &entry)) {
+        do {
+            HandleWrapper hProc(OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, entry.th32ProcessID));
+            FILETIME ftCreate, ftExit, ftKernel, ftUser;
+            if (hProc.h && GetProcessTimes(hProc, &ftCreate, &ftExit, &ftKernel, &ftUser)) {
+                processes.push_back({ entry.szExeFile, entry.th32ProcessID, ftCreate });
+            }
+        } while (Process32NextW(snapshot, &entry));
+    }
+    return processes;
+}
+
+DWORD SelectParentProcess(int strategy) {
+    std::vector<std::wstring> systemCandidates = { L"explorer.exe", L"svchost.exe" };
+    std::vector<std::wstring> userCandidates = { L"cmd.exe", L"powershell.exe" };
+    auto allProcs = GetAllProcesses();
+
+    switch (strategy) {
+    case 1:
+        for (const auto& name : systemCandidates) {
+            DWORD pid = GetProcessIdByName(name);
+            if (pid != 0) return pid;
+        }
+        break;
+    case 2:
+        for (const auto& name : userCandidates) {
+            DWORD pid = GetProcessIdByName(name);
+            if (pid != 0) return pid;
+        }
+        break;
+    case 3:
+        if (!allProcs.empty()) {
+            std::sort(allProcs.begin(), allProcs.end(), [](const ProcessInfo& a, const ProcessInfo& b) {
+                return CompareFileTime(&a.creationTime, &b.creationTime) < 0;
+                });
+            return allProcs.front().pid;
+        }
+        break;
+    case 4:
+        if (!allProcs.empty()) {
+            std::random_device rd;
+            std::mt19937 gen(rd());
+            std::uniform_int_distribution<> dis(0, static_cast<int>(allProcs.size() - 1));
+            return allProcs[dis(gen)].pid;
+        }
+        break;
+    }
+    return 0;
+}
+
+void LaunchWithParent(HWND hwnd, int strategy) {
+    DWORD parentPid = SelectParentProcess(strategy);
+    if (parentPid == 0) {
+        MessageBox(hwnd, L"未能找到合适的父进程。", L"错误", MB_ICONERROR);
+        AppendLog(L"未能找到合适的父进程。");
+        return;
+    }
+    LaunchWithSpecificParent(hwnd, parentPid);
+}
+
+void LaunchWithSpecificParent(HWND hwnd, DWORD parentPid) {
+    if (selectedAppPath.empty()) {
+        MessageBox(hwnd, L"请先选择要启动的程序。", L"提示", MB_ICONWARNING);
+        AppendLog(L"启动失败：未选择程序路径。");
+        return;
+    }
+
+    AppendLog(L"选定父进程 PID: " + std::to_wstring(parentPid));
+
+    HandleWrapper hParent(OpenProcess(PROCESS_CREATE_PROCESS | PROCESS_QUERY_INFORMATION, FALSE, parentPid));
+    if (!hParent.h || hParent.h == INVALID_HANDLE_VALUE) {
+        AppendLog(L"无法打开父进程句柄。");
+        MessageBox(hwnd, L"无法打开父进程句柄，请尝试以管理员身份运行。", L"错误", MB_ICONERROR);
+        return;
+    }
+
+    STARTUPINFOEXW si;
+    PROCESS_INFORMATION pi;
+    SIZE_T attrSize = 0;
+
+    ZeroMemory(&si, sizeof(si));
+    ZeroMemory(&pi, sizeof(pi));
+    si.StartupInfo.cb = sizeof(STARTUPINFOEXW);
+
+    if (!InitializeProcThreadAttributeList(NULL, 1, 0, &attrSize) &&
+        GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+        AppendLog(L"初始化属性列表失败。");
+        return;
+    }
+
+    si.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, attrSize);
+    if (!si.lpAttributeList) {
+        AppendLog(L"分配属性列表内存失败。");
+        return;
+    }
+
+    if (!InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &attrSize)) {
+        HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
+        AppendLog(L"初始化属性列表失败。");
+        return;
+    }
+
+    if (!UpdateProcThreadAttribute(si.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS,
+        &hParent.h, sizeof(HANDLE), NULL, NULL)) {
+        DeleteProcThreadAttributeList(si.lpAttributeList);
+        HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
+        AppendLog(L"更新属性列表失败。");
+        return;
+    }
+
+    std::wstring cmdLine = L"\"" + selectedAppPath + L"\"";
+
+    BOOL success = CreateProcessW(
+        NULL,
+        &cmdLine[0],
+        NULL,
+        NULL,
+        FALSE,
+        EXTENDED_STARTUPINFO_PRESENT,
+        NULL,
+        NULL,
+        &si.StartupInfo,
+        &pi
+    );
+
+    if (!success) {
+        DWORD err = GetLastError();
+        AppendLog(L"创建进程失败，错误码：" + std::to_wstring(err));
+    }
+    else {
+        AppendLog(L"进程已成功启动！");
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+
+    DeleteProcThreadAttributeList(si.lpAttributeList);
+    HeapFree(GetProcessHeap(), 0, si.lpAttributeList);
+}
+
+LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    switch (uMsg) {
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case ID_BUTTON_SELECT_FILE: {
+            wchar_t filePath[MAX_PATH] = {};
+            OPENFILENAMEW ofn = {};
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner = hwnd;
+            ofn.lpstrFilter = L"可执行文件 (*.exe)\0*.exe\0所有文件 (*.*)\0*.*\0";
+            ofn.lpstrFile = filePath;
+            ofn.nMaxFile = MAX_PATH;
+            ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+            ofn.lpstrTitle = L"选择要启动的程序";
+
+            if (GetOpenFileNameW(&ofn)) {
+                selectedAppPath = filePath;
+                AppendLog(L"已选择程序路径：" + selectedAppPath);
+            }
+            else {
+                AppendLog(L"用户取消了文件选择。");
+            }
+            break;
+        }
+        case ID_BUTTON_SYSTEM: LaunchWithParent(hwnd, 1); break;
+        case ID_BUTTON_USER:   LaunchWithParent(hwnd, 2); break;
+		case ID_BUTTON_EARLY:  LaunchWithParent(hwnd, 3); break;
+        case ID_BUTTON_RANDOM: LaunchWithParent(hwnd, 4); break;
+        case ID_BUTTON_SELECT_PID: {
+            wchar_t pidText[32] = {};
+            GetWindowText(GetDlgItem(hwnd, ID_EDIT_PID_INPUT), pidText, 32);
+            DWORD pid = _wtoi(pidText);
+            if (pid == 0) {
+                MessageBox(hwnd, L"请输入有效的 PID。", L"错误", MB_ICONERROR);
+                return 0;
+            }
+            AppendLog(L"用户手动输入 PID: " + std::to_wstring(pid));
+            LaunchWithSpecificParent(hwnd, pid);
+            break;
+        }
+        case ID_BUTTON_FIND_NVIDIA: {
+            auto pids = FindNvidiaOverlayPIDs();
+            if (pids.empty()) {
+                AppendLog(L"未找到 NVIDIA Overlay.exe 的进程。");
+            }
+            else {
+                AppendLog(L"找到 NVIDIA Overlay.exe 的进程 PID：");
+                for (DWORD pid : pids) {
+                    AppendLog(L" - PID: " + std::to_wstring(pid));
+                }
+            }
+            break;
+        }
+        }
+        break;
+
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProc(hwnd, uMsg, wParam, lParam);
+}
+
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
+    EnableDebugPrivilege();
+    const wchar_t CLASS_NAME[] = L"ParentSpoofWindow";
+
+    WNDCLASS wc = {};
+    wc.lpfnWndProc = WindowProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = CLASS_NAME;
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    wc.style = CS_HREDRAW | CS_VREDRAW;
+
+    if (!RegisterClass(&wc)) {
+        DWORD err = GetLastError();
+        if (err != ERROR_CLASS_ALREADY_EXISTS) {
+            std::wstring msg = L"窗口类注册失败，错误码：" + std::to_wstring(err);
+            MessageBox(NULL, msg.c_str(), L"错误", MB_ICONERROR);
+            return 0;
+        }
+    }
+
+    int screenW = GetSystemMetrics(SM_CXSCREEN);
+    int screenH = GetSystemMetrics(SM_CYSCREEN);
+    int winW = 410, winH = 460;
+    int posX = (screenW - winW) / 2;
+    int posY = (screenH - winH) / 2;
+
+    HWND hwnd = CreateWindowEx(0, CLASS_NAME, L"父进程伪装启动器",
+        WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX,
+        posX, posY, winW, winH,
+        NULL, NULL, hInstance, NULL);
+
+    if (!hwnd) {
+        MessageBox(NULL, L"窗口创建失败。", L"错误", MB_ICONERROR);
+        return 0;
+    }
+
+    HFONT hFont = CreateFontW(
+        18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI"
+    );
+
+    HWND hLabel = CreateWindow(L"STATIC", L"先选择启动程序，再选择父进程策略：", WS_VISIBLE | WS_CHILD,
+        50, 10, 300, 20, hwnd, NULL, hInstance, NULL);
+    SendMessage(hLabel, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    HWND btn1 = CreateWindow(L"BUTTON", L"常见系统进程", WS_VISIBLE | WS_CHILD,
+        50, 120, 140, 30, hwnd, (HMENU)ID_BUTTON_SYSTEM, hInstance, NULL);
+    //HWND btn2 = CreateWindow(L"BUTTON", L"当前用户进程", WS_VISIBLE | WS_CHILD,
+    //    50, 90, 300, 40, hwnd, (HMENU)ID_BUTTON_USER, hInstance, NULL);
+    HWND btn3 = CreateWindow(L"BUTTON", L"最早启动进程", WS_VISIBLE | WS_CHILD,
+        210, 80, 140, 30, hwnd, (HMENU)ID_BUTTON_EARLY, hInstance, NULL);
+    HWND btn4 = CreateWindow(L"BUTTON", L"随机选择进程", WS_VISIBLE | WS_CHILD,
+        50, 80, 140, 30, hwnd, (HMENU)ID_BUTTON_RANDOM, hInstance, NULL);
+    HWND btnSelect = CreateWindow(L"BUTTON", L"选择启动程序", WS_VISIBLE | WS_CHILD,
+        50, 40, 300, 30, hwnd, (HMENU)ID_BUTTON_SELECT_FILE, hInstance, NULL);
+    HWND btnFindNvidia = CreateWindow(L"BUTTON", L"查找 NVOL 进程", WS_VISIBLE | WS_CHILD,
+        210, 120, 140, 30, hwnd, (HMENU)ID_BUTTON_FIND_NVIDIA, hInstance, NULL);
+    SendMessage(btnFindNvidia, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    SendMessage(btn1, WM_SETFONT, (WPARAM)hFont, TRUE);
+    //SendMessage(btn2, WM_SETFONT, (WPARAM)hFont, TRUE);
+    SendMessage(btn3, WM_SETFONT, (WPARAM)hFont, TRUE);
+    SendMessage(btn4, WM_SETFONT, (WPARAM)hFont, TRUE);
+    SendMessage(btnSelect, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    HWND hPidLabel = CreateWindow(L"STATIC", L"手动输入父进程 PID：", WS_VISIBLE | WS_CHILD,
+        50, 150, 300, 20, hwnd, NULL, hInstance, NULL);
+    SendMessage(hPidLabel, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    HWND hPidInput = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_VISIBLE | WS_CHILD | ES_NUMBER,
+        50, 170, 200, 25, hwnd, (HMENU)ID_EDIT_PID_INPUT, hInstance, NULL);
+    SendMessage(hPidInput, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    HWND hPidLaunchBtn = CreateWindow(L"BUTTON", L"以该 PID 启动", WS_VISIBLE | WS_CHILD,
+        260, 170, 90, 25, hwnd, (HMENU)ID_BUTTON_SELECT_PID, hInstance, NULL);
+    SendMessage(hPidLaunchBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    hLogBox = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"",
+        WS_VISIBLE | WS_CHILD | ES_MULTILINE | ES_READONLY | WS_VSCROLL,
+        50, 200, 300, 200, hwnd, (HMENU)ID_LOG_BOX, hInstance, NULL);
+    SendMessage(hLogBox, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    ShowWindow(hwnd, nCmdShow);
+    UpdateWindow(hwnd);
+
+    MSG msg = {};
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    DeleteObject(hFont);
+    return 0;
+}
