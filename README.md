@@ -1,4 +1,4 @@
-# spoof_new
+**简体中文** | [English](README_EN.md)
 ## 父进程启动器
 
 这是一个运行在 `Windows` 系统下的gui工具，可以选择一个已有的进程作为“父进程”启动另一个程序。主要用于测试或研究进程行为，或许可能用在 [这里的最新版](https://github.com/LiteLoaderQQNT/LiteLoaderQQNT)  ~我不知道啊 我真的不知道行不行 我随便写的github仓库（~
