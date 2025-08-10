@@ -5,16 +5,112 @@
 #include <string>
 #include <algorithm>
 #include <random>
+#include <commctrl.h> 
+#pragma comment(lib, "comctl32.lib")
 
-#define ID_BUTTON_SYSTEM       101
-#define ID_BUTTON_USER         102
-#define ID_BUTTON_EARLY        103
-#define ID_BUTTON_RANDOM       104
-#define ID_BUTTON_SELECT_FILE  105
-#define ID_BUTTON_SELECT_PID   106
-#define ID_EDIT_PID_INPUT      107
-#define ID_BUTTON_FIND_NVIDIA  108
-#define ID_LOG_BOX             201
+
+#define ID_BUTTON_SYSTEM          101
+#define ID_BUTTON_USER            102
+#define ID_BUTTON_EARLY           103
+#define ID_BUTTON_RANDOM          104
+#define ID_BUTTON_SELECT_FILE     105
+#define ID_BUTTON_SELECT_PID      106
+#define ID_EDIT_PID_INPUT         107
+#define ID_BUTTON_FIND_NVIDIA     108
+#define ID_BUTTON_SELECT_PROCESS  109
+#define ID_LOG_BOX                201
+#define ID_PROCESS_LIST 3001
+
+#ifndef WC_LISTVIEW
+#define WC_LISTVIEW L"SysListView32"
+#endif
+
+
+void ShowProcessSelector(HWND hOwner) {
+    InitCommonControls();  // 初始化控件库
+
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = [](HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) -> LRESULT {
+        static HWND hList;
+        switch (msg) {
+        case WM_CREATE: {
+            hList = CreateWindowExW(0, WC_LISTVIEW, nullptr,
+                WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT | LVS_SINGLESEL,
+                10, 10, 460, 380, hWnd, (HMENU)ID_PROCESS_LIST, nullptr, nullptr);
+
+            ListView_SetExtendedListViewStyle(hList, LVS_EX_FULLROWSELECT);
+
+            LVCOLUMNW col = {};
+            col.mask = LVCF_TEXT | LVCF_WIDTH;
+            col.cx = 250;
+            col.pszText = const_cast<LPWSTR>(L"进程名");
+            ListView_InsertColumn(hList, 0, &col);
+
+            col.cx = 100;
+            col.pszText = const_cast<LPWSTR>(L"PID");
+            ListView_InsertColumn(hList, 1, &col);
+
+            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            PROCESSENTRY32W pe = { sizeof(pe) };
+            int index = 0;
+            if (Process32FirstW(snap, &pe)) {
+                do {
+                    LVITEMW item = {};
+                    item.mask = LVIF_TEXT;
+                    item.iItem = index;
+                    item.iSubItem = 0;
+                    item.pszText = pe.szExeFile;
+                    ListView_InsertItem(hList, &item);
+
+                    wchar_t pidStr[16];
+                    swprintf(pidStr, 16, L"%u", pe.th32ProcessID);
+                    ListView_SetItemText(hList, index, 1, pidStr);
+
+                    index++;
+                } while (Process32NextW(snap, &pe));
+            }
+            CloseHandle(snap);
+            break;
+        }
+        case WM_NOTIFY: {
+            LPNMHDR hdr = (LPNMHDR)lParam;
+            if (hdr->idFrom == ID_PROCESS_LIST && hdr->code == NM_DBLCLK) {
+                int sel = ListView_GetNextItem(hList, -1, LVNI_SELECTED);
+                if (sel != -1) {
+                    wchar_t pidStr[16];
+                    ListView_GetItemText(hList, sel, 1, pidStr, 16);
+
+                    HWND hMain = GetWindow(hWnd, GW_OWNER);
+                    HWND hPidEdit = GetDlgItem(hMain, ID_EDIT_PID_INPUT);
+                    SetWindowTextW(hPidEdit, pidStr);
+                    DestroyWindow(hWnd);
+                }
+            }
+            break;
+        }
+        case WM_CLOSE:
+            DestroyWindow(hWnd);
+            return 0;
+
+        case WM_DESTROY:
+            return 0;
+        }
+        return DefWindowProcW(hWnd, msg, wParam, lParam);
+        };
+    wc.hInstance = GetModuleHandle(nullptr);
+    wc.lpszClassName = L"ProcessSelectorWindow";
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    RegisterClassW(&wc);
+
+    HWND hWnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"ProcessSelectorWindow", L"选择进程（双击自动填充）",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+        CW_USEDEFAULT, CW_USEDEFAULT, 500, 420,
+        hOwner, nullptr, wc.hInstance, nullptr);
+
+    ShowWindow(hWnd, SW_SHOW);
+    UpdateWindow(hWnd);
+}
 
 std::wstring selectedAppPath = L"";
 HWND hLogBox = nullptr;
@@ -302,6 +398,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             }
             break;
         }
+        case ID_BUTTON_SELECT_PROCESS: {
+            ShowProcessSelector(hwnd);
+            break;
+        }
         }
         break;
 
@@ -312,7 +412,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
 
+
+
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
+    InitCommonControls();
     EnableDebugPrivilege();
     const wchar_t CLASS_NAME[] = L"ParentSpoofWindow";
 
@@ -336,7 +439,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
 
     int screenW = GetSystemMetrics(SM_CXSCREEN);
     int screenH = GetSystemMetrics(SM_CYSCREEN);
-    int winW = 410, winH = 460;
+    int winW = 410, winH = 500;
     int posX = (screenW - winW) / 2;
     int posY = (screenH - winH) / 2;
 
@@ -380,21 +483,26 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     SendMessage(btn4, WM_SETFONT, (WPARAM)hFont, TRUE);
     SendMessage(btnSelect, WM_SETFONT, (WPARAM)hFont, TRUE);
 
-    HWND hPidLabel = CreateWindow(L"STATIC", L"手动输入父进程 PID：", WS_VISIBLE | WS_CHILD,
-        50, 150, 300, 20, hwnd, NULL, hInstance, NULL);
+    HWND hPidLabel = CreateWindow(L"STATIC", L"或者手动输入父进程 PID：", WS_VISIBLE | WS_CHILD,
+        50, 190, 300, 20, hwnd, NULL, hInstance, NULL);
     SendMessage(hPidLabel, WM_SETFONT, (WPARAM)hFont, TRUE);
 
     HWND hPidInput = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_VISIBLE | WS_CHILD | ES_NUMBER,
-        50, 170, 200, 25, hwnd, (HMENU)ID_EDIT_PID_INPUT, hInstance, NULL);
+        50, 210, 200, 25, hwnd, (HMENU)ID_EDIT_PID_INPUT, hInstance, NULL);
     SendMessage(hPidInput, WM_SETFONT, (WPARAM)hFont, TRUE);
 
     HWND hPidLaunchBtn = CreateWindow(L"BUTTON", L"以该 PID 启动", WS_VISIBLE | WS_CHILD,
-        260, 170, 90, 25, hwnd, (HMENU)ID_BUTTON_SELECT_PID, hInstance, NULL);
+        260, 210, 90, 25, hwnd, (HMENU)ID_BUTTON_SELECT_PID, hInstance, NULL);
     SendMessage(hPidLaunchBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    HWND btnSelectProcess = CreateWindow(L"BUTTON", L"点击选择进程", WS_VISIBLE | WS_CHILD,
+        50, 160, 300, 30, hwnd, (HMENU)ID_BUTTON_SELECT_PROCESS, hInstance, NULL);
+    SendMessage(btnSelectProcess, WM_SETFONT, (WPARAM)hFont, TRUE);
+
 
     hLogBox = CreateWindowEx(WS_EX_CLIENTEDGE, L"EDIT", L"",
         WS_VISIBLE | WS_CHILD | ES_MULTILINE | ES_READONLY | WS_VSCROLL,
-        50, 200, 300, 200, hwnd, (HMENU)ID_LOG_BOX, hInstance, NULL);
+        50, 240, 300, 200, hwnd, (HMENU)ID_LOG_BOX, hInstance, NULL);
     SendMessage(hLogBox, WM_SETFONT, (WPARAM)hFont, TRUE);
 
     ShowWindow(hwnd, nCmdShow);
